@@ -1,89 +1,112 @@
 import streamlit as st
-from supabase import create_client, Client
-import uuid
+import pandas as pd
+import pdfplumber
+import re
 
-# --- 1. CONFIGURAÇÃO E SEGURANÇA ---
-st.set_page_config(page_title="Portal do Fornecedor - Apoena", layout="centered", page_icon="🤝")
+st.set_page_config(page_title="Auditor Automático - Apoena", layout="wide", page_icon="🔎")
 
-@st.cache_resource
-def init_connection():
-    # O st.secrets puxa as senhas do cofre invisível do Streamlit Cloud
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    return create_client(url, key)
-
-try:
-    supabase: Client = init_connection()
-except Exception as e:
-    st.error("Erro de conexão com o servidor da Aura.")
-    st.stop()
-
-# --- 2. INTERFACE DE LOGIN ---
-st.title("🤝 Portal do Fornecedor")
-st.markdown("Sistema de envio de faturamentos e medições - Gestão de Contratos.")
+st.title("🔎 Auditor Automático de Faturação")
+st.markdown("Cruzamento de dados: **Sistema (SIGec/Supabase) vs. Ficheiro PDF (Biomed)**")
 st.markdown("---")
 
-fornecedores = ["Selecione sua empresa...", "Biomed", "Plaza Hotel"]
-fornecedor_logado = st.selectbox("Identificação:", fornecedores)
+# 1. SIMULAÇÃO DO BANCO DE DADOS (SIGec / Supabase)
+# Na versão final, isto viria de uma consulta direta ao seu banco de dados.
+# Aqui, coloquei um valor errado de propósito (40.00) para forçar o sistema a apanhar a divergência.
+dados_sistema = pd.DataFrame({
+    "Colaborador": [
+        "JONATHAN DAVID REZENDE CORREA", 
+        "FERNANDO BENFICA DE OLIVEIRA LEMOS", 
+        "PAULO RICARDO DE ALMEIDA GOMES"
+    ],
+    "Exame_Esperado": ["Exame Clínico", "Exame Clínico", "ASO Admissional"],
+    "Valor_Sistema": [40.00, 45.00, 45.00] # O valor do Jonathan está 40 em vez de 45
+})
 
-# --- 3. FLUXO DO FORNECEDOR: BIOMED ---
-if fornecedor_logado == "Biomed":
-    st.subheader("🏥 Lançamento de Exames Ocupacionais")
-    
-    # Usamos st.form para o fornecedor preencher tudo antes de enviar
-    with st.form("form_biomed", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            nome_colaborador = st.text_input("Nome Completo do Colaborador:").strip().upper()
-            data_exame = st.date_input("Data do Exame:")
-        with col2:
-            tipo_exame = st.selectbox("Tipo de Exame:", ["Exame Clínico", "ASO Admissional", "ASO Demissional", "ASO Periódico", "Audiometria", "Outros"])
-            valor_exame = st.number_input("Valor Unitário (R$):", min_value=0.0, format="%.2f")
+st.subheader("1. Dados Aprovados no Sistema (Referência)")
+st.dataframe(dados_sistema, use_container_width=True)
 
-        st.markdown("---")
-        st.write("🔒 **Evidência para Auditoria (Obrigatório)**")
-        # Campo para o fornecedor subir o PDF original da fatura/exame
-        arquivo_pdf = st.file_uploader("Anexe o arquivo PDF gerado pelo seu sistema:", type=['pdf'])
+# 2. CARREGAMENTO DO FICHEIRO DE EVIDÊNCIA
+st.subheader("2. Fatura do Fornecedor (Contraprova)")
+ficheiro_pdf = st.file_uploader("Arraste o PDF da Biomed para iniciar a auditoria cruzada:", type=['pdf'])
 
-        # Botão de envio central
-        enviado = st.form_submit_button("✅ Enviar Dados e Comprovante para a Aura", use_container_width=True)
+if ficheiro_pdf:
+    with st.spinner("A ler o PDF e a cruzar informações..."):
+        dados_pdf = []
+        
+        # --- Lógica de Extração do PDF ---
+        with pdfplumber.open(ficheiro_pdf) as pdf:
+            texto_completo = "\n".join([pagina.extract_text() or "" for pagina in pdf.pages])
+            linhas = texto_completo.split('\n')
+            
+            nome_atual = "DESCONHECIDO"
+            
+            for linha in linhas:
+                # Tenta capturar o nome do colaborador (geralmente antes do exame)
+                if "(" in linha e ")" in linha e "em" in linha:
+                    # Limpa o texto para extrair apenas o nome antes do CPF
+                    nome_atual = linha.split("(")[0].strip()
+                    
+                # Captura a linha do exame e do valor
+                elif "R$" in linha:
+                    partes = linha.split("R$")
+                    if len(partes) >= 2:
+                        nome_exame = partes[0].replace('"', '').replace(',', '').strip()
+                        # Extrai o valor numérico para facilitar a comparação matemática
+                        valor_texto = partes[1].replace('"', '').replace(',', '').strip()
+                        try:
+                            valor_numerico = float(valor_texto.replace('.', '').replace(',', '.'))
+                        except:
+                            valor_numerico = 0.0
+                            
+                        if nome_exame and nome_atual != "DESCONHECIDO":
+                            dados_pdf.append({
+                                "Colaborador": nome_atual,
+                                "Exame_Cobrado": nome_exame,
+                                "Valor_PDF": valor_numerico
+                            })
+                            # Reseta o nome para evitar duplicações erradas
+                            nome_atual = "DESCONHECIDO"
 
-        if enviado:
-            if not nome_colaborador or valor_exame <= 0 or not arquivo_pdf:
-                st.error("⚠️ Por favor, preencha todos os campos e anexe o PDF do comprovante.")
+        df_pdf = pd.DataFrame(dados_pdf)
+
+        # 3. O CRUZAMENTO DE DADOS (A MÁGICA DO PANDAS)
+        if not df_pdf.empty:
+            # Faz o "PROCV" juntando as duas tabelas usando o Nome do Colaborador como chave
+            df_auditoria = pd.merge(dados_sistema, df_pdf, on="Colaborador", how="outer")
+            
+            # Preenche espaços vazios (caso alguém esteja no PDF mas não no sistema e vice-versa)
+            df_auditoria.fillna({"Valor_Sistema": 0.0, "Valor_PDF": 0.0, "Exame_Esperado": "-", "Exame_Cobrado": "-"}, inplace=True)
+            
+            # 4. APLICAÇÃO DAS REGRAS DE NEGÓCIO (Identificar os Erros)
+            def classificar_status(linha):
+                if linha["Valor_Sistema"] == 0.0:
+                    return "🔴 Cobrança Indevida (Não está no sistema)"
+                elif linha["Valor_PDF"] == 0.0:
+                    return "🟡 Faltou Cobrar (Está no sistema, mas não no PDF)"
+                elif linha["Valor_Sistema"] != linha["Valor_PDF"]:
+                    return "🔴 Divergência de Valor"
+                else:
+                    return "✅ OK (Valores conferem)"
+
+            df_auditoria["Status da Auditoria"] = df_auditoria.apply(classificar_status, axis=1)
+            
+            # 5. EXIBIÇÃO VISUAL DOS RESULTADOS
+            st.markdown("---")
+            st.subheader("3. Resultado da Auditoria Automática")
+            
+            # Conta os erros para o resumo
+            erros = len(df_auditoria[df_auditoria["Status da Auditoria"].str.contains("🔴")])
+            
+            if erros > 0:
+                st.error(f"Atenção: Foram encontradas {erros} divergências que bloqueiam o pagamento.")
             else:
-                with st.spinner("Processando e enviando para o banco de dados..."):
-                    try:
-                        # PASSO A: Criar um nome único para o PDF para não substituir outros
-                        nome_arquivo_unico = f"biomed_{uuid.uuid4().hex}.pdf"
-                        
-                        # PASSO B: Fazer o Upload do PDF para o Storage do Supabase (Pasta 'comprovantes')
-                        file_bytes = arquivo_pdf.getvalue()
-                        supabase.storage.from_("comprovantes").upload(
-                            file=file_bytes,
-                            path=nome_arquivo_unico,
-                            file_options={"content-type": "application/pdf"}
-                        )
-                        
-                        # PASSO C: Gerar o link público desse PDF para aparecer no seu Dashboard
-                        link_evidencia = supabase.storage.from_("comprovantes").get_public_url(nome_arquivo_unico)
-                        
-                        # PASSO D: Salvar os números e o link na Tabela do Banco de Dados
-                        dados_bd = {
-                            "fornecedor": "Biomed",
-                            "colaborador": nome_colaborador,
-                            "data_exame": str(data_exame),
-                            "tipo_exame": tipo_exame,
-                            "valor": valor_exame,
-                            "link_pdf": link_evidencia
-                        }
-                        supabase.table("faturamentos").insert(dados_bd).execute()
-                        
-                        st.success("🚀 Registro e evidência salvos com sucesso!")
-                        st.balloons()
-                        
-                    except Exception as e:
-                        st.error(f"Ocorreu um erro no servidor: {e}")
-
-elif fornecedor_logado == "Plaza Hotel":
-    st.info("Formulário do Plaza Hotel será ativado na próxima etapa do Piloto.")
+                st.success("Tudo certo! A fatura corresponde exatamente ao sistema. Pagamento libertado.")
+            
+            # Mostra a tabela final focada na auditoria
+            st.dataframe(
+                df_auditoria[["Colaborador", "Exame_Esperado", "Valor_Sistema", "Valor_PDF", "Status da Auditoria"]], 
+                use_container_width=True
+            )
+            
+        else:
+            st.warning("Não foi possível extrair dados válidos deste PDF para cruzamento.")
