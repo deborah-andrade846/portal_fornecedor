@@ -42,7 +42,7 @@ if ficheiro_pdf:
             
             for linha in linhas:
                 # Tenta capturar o nome do colaborador (geralmente antes do exame)
-                if "(" in linha e ")" in linha e "em" in linha:
+                if "(" in linha and ")" in linha and "em" in linha:
                     # Limpa o texto para extrair apenas o nome antes do CPF
                     nome_atual = linha.split("(")[0].strip()
                     
